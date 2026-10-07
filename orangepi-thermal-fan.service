@@ -1,8 +1,7 @@
 [Unit]
 Description=Orange Pi 5 thermal fan controller
 DefaultDependencies=no
-After=local-fs.target systemd-modules-load.service systemd-udev-trigger.service dev-gpiochip1.device
-Requires=dev-gpiochip1.device
+After=local-fs.target systemd-modules-load.service systemd-udev-trigger.service
 Before=basic.target shutdown.target
 Conflicts=shutdown.target
 StartLimitIntervalSec=0
@@ -11,6 +10,7 @@ StartLimitIntervalSec=0
 Type=simple
 EnvironmentFile=-/etc/default/orangepi-thermal-fan
 ExecStart=/usr/local/lib/orangepi-thermal-fan/fan-control.sh
+ExecStartPre=/usr/bin/test -c /dev/gpiochip1
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=5s
