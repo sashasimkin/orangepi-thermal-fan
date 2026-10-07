@@ -1,0 +1,6 @@
+CHIP=gpiochip1
+LINE=14
+ON_TEMP=80000
+OFF_TEMP=70000
+CHECK_INTERVAL=5
+CONSUMER=orangepi-thermal-fan

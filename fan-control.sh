@@ -1,65 +1,75 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -uo pipefail
 
-# Configuration (from Environment Variables with Defaults)
 CHIP="${CHIP:-gpiochip1}"
 LINE="${LINE:-14}"
-ON_TEMP="${ON_TEMP:-70000}"       # 70°C
-OFF_TEMP="${OFF_TEMP:-50000}"      # 50°C
-CHECK_INTERVAL="${CHECK_INTERVAL:-30}"   # Seconds
-CONSUMER="${CONSUMER:-opi5-fan}"
+ON_TEMP="${ON_TEMP:-80000}"
+OFF_TEMP="${OFF_TEMP:-70000}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
+CONSUMER="${CONSUMER:-orangepi-thermal-fan}"
+TEMP_PATH=/sys/class/thermal/thermal_zone0/temp
+CURRENT_STATE=UNKNOWN
+GPIO_PID=
 
-echo "Starting Fan Control script with configuration:"
-echo "  CHIP: $CHIP"
-echo "  LINE: $LINE"
-echo "  ON_TEMP: $ON_TEMP"
-echo "  OFF_TEMP: $OFF_TEMP"
-echo "  CHECK_INTERVAL: $CHECK_INTERVAL"
-echo "  CONSUMER: $CONSUMER"
+echo "Starting orangepi-thermal-fan (chip=$CHIP line=$LINE on=${ON_TEMP}mC off=${OFF_TEMP}mC interval=${CHECK_INTERVAL}s)"
 
-# State tracking
-CURRENT_STATE="UNKNOWN"
-
-# Kill any existing fan control processes on start
-pkill -f "$CONSUMER" > /dev/null 2>&1
-
-# Trap termination signals to ensure the fan is left in a safe state (ON) or OFF based on preference,
-# let's leave it as it is or ensure we kill gpioset
-cleanup() {
-    echo "Received termination signal. Stopping fan..."
-    pkill -f "$CONSUMER" > /dev/null 2>&1
-    # Sink to GND
-    gpioset -z -C "$CONSUMER" -c "$CHIP" "$LINE=0"
-    exit 0
+stop_gpio() {
+  if [[ -n "$GPIO_PID" ]]; then
+    kill "$GPIO_PID" 2>/dev/null || true
+    wait "$GPIO_PID" 2>/dev/null || true
+    GPIO_PID=
+  fi
 }
 
-trap cleanup SIGINT SIGTERM
+set_fan() {
+  local value="$1"
+  local state="$2"
+
+  stop_gpio
+  gpioset -C "$CONSUMER" -c "$CHIP" "$LINE=$value" &
+  GPIO_PID=$!
+  sleep 0.1
+  if ! kill -0 "$GPIO_PID" 2>/dev/null; then
+    wait "$GPIO_PID" || return 1
+    echo "Error: gpioset exited before acquiring $CHIP line $LINE" >&2
+    return 1
+  fi
+
+  CURRENT_STATE="$state"
+  echo "Fan state changed to $CURRENT_STATE. CPU Temp: ${TEMP_C:-unknown}°C"
+}
+
+cleanup() {
+  trap - EXIT INT TERM
+  echo "Stopping fan controller."
+  stop_gpio
+  exit 0
+}
+trap cleanup EXIT INT TERM
 
 while true; do
-    if [ ! -f /sys/class/thermal/thermal_zone0/temp ]; then
-        echo "Error: Cannot read temperature from /sys/class/thermal/thermal_zone0/temp"
-        sleep "$CHECK_INTERVAL"
-        continue
-    fi
+  if [[ ! -r "$TEMP_PATH" ]]; then
+    echo "Cannot read $TEMP_PATH; keeping fan ON."
+    TEMP_RAW=
+  else
+    IFS= read -r TEMP_RAW < "$TEMP_PATH" || TEMP_RAW=
+  fi
 
-    TEMP_RAW=$(cat /sys/class/thermal/thermal_zone0/temp)
+  if [[ "$TEMP_RAW" =~ ^[0-9]+$ ]]; then
     TEMP_C=$((TEMP_RAW / 1000))
-
-    if [ "$TEMP_RAW" -gt "$ON_TEMP" ] && [ "$CURRENT_STATE" != "ON" ]; then
-        # Kill the 'OFF' process, then start 'ON'
-        pkill -f "$CONSUMER" > /dev/null 2>&1
-        gpioset -z -C "$CONSUMER" -c "$CHIP" "$LINE=1"
-        CURRENT_STATE="ON"
-        echo "Fan state changed to ON. CPU Temp: ${TEMP_C}°C"
-
-    elif [ "$TEMP_RAW" -lt "$OFF_TEMP" ] && [ "$CURRENT_STATE" != "OFF" ]; then
-        # Kill the 'ON' process, then start 'OFF' (to sink the pin to GND)
-        pkill -f "$CONSUMER" > /dev/null 2>&1
-        gpioset -z -C "$CONSUMER" -c "$CHIP" "$LINE=0"
-        CURRENT_STATE="OFF"
-        echo "Fan state changed to OFF. CPU Temp: ${TEMP_C}°C"
+    if (( TEMP_RAW >= ON_TEMP )); then
+      [[ "$CURRENT_STATE" == ON ]] || set_fan 1 ON
+    elif (( TEMP_RAW < OFF_TEMP )); then
+      [[ "$CURRENT_STATE" == OFF ]] || set_fan 0 OFF
+    elif [[ "$CURRENT_STATE" == UNKNOWN ]]; then
+      # In the hysteresis band, prefer active cooling on startup.
+      set_fan 1 ON
     fi
+  else
+    TEMP_C=unknown
+    [[ "$CURRENT_STATE" == ON ]] || set_fan 1 ON
+  fi
 
-    # sleep in background and wait allows trap to interrupt sleep immediately
-    sleep "$CHECK_INTERVAL" &
-    wait $!
+  sleep "$CHECK_INTERVAL" &
+  wait "$!"
 done
